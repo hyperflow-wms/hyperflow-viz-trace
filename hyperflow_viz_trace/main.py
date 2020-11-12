@@ -322,7 +322,7 @@ def visualizeDir(sourceDir, displayOnly, showActiveJobs, plotFullNodesNames):
     y_ticks = range(rowHalfHeight, (len(nodesJobsNO)+1)*rowFullHeight, rowFullHeight)
     y_labels = [(key) for key in natsorted(nodesJobsNO.keys())]
     if plotFullNodesNames is False:
-        y_labels = map(lambda label: label.rsplit('-', 1)[1], y_labels)
+        y_labels = map(lambda label: label.rsplit('-', 1)[-1], y_labels)
     max_time = 0.0
     for _, jobGroup in nodesJobsNO.items():
         for jobID in jobGroup:

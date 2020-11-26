@@ -1,5 +1,8 @@
-# hyperflow-viz-trace
+# Visualization of Hyperflow execution traces
 
+`hflow-viz-trace`: generates Gantt chart visualization from [workflow execution logs](https://github.com/hyperflow-wms/log-parser) 
+
+Usage:
 ```
 hflow-viz-trace: converts parsed HyperFlow logs into Gantt chart of workflow execution
 Usage:

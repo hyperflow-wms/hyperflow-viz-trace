@@ -23,5 +23,6 @@ setuptools.setup(
         'pandas',
         'natsort',
         'scipy',
+        'matplotlib==3.2.2'
     ]
 )

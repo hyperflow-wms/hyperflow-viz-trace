@@ -56,6 +56,9 @@ def splitJobsIntoDisjointGroups(jobs):
     jobsByStartTime = {}
     for jobId, jobDetails in jobs.items():
         timeStart = jobDetails['handlerStart']
+        if ('handlerEnd' not in jobDetails): # dirty fix if for some reason 'handlerEnd' is missing
+            print("WARNING: missing handlerEnd event in job", jobId)
+            jobDetails['handlerEnd'] = jobDetails['jobEnd']
         if timeStart not in jobsByStartTime:
             jobsByStartTime[timeStart] = []
         details = jobDetails.copy()
@@ -227,7 +230,11 @@ def extractOrderedTaskTypes(metricList):
     for metric in metricList:
         if metric['parameter'] != 'event':
             continue
-        name = metric['name']
+        try:
+            name = metric['name']
+        except:
+            continue; # ignoring metric with no job name - probably evicted pod 
+            #raise KeyError('metric[name]', metric);
         metricTime = metric['time']
         if name not in taskTypes:
             taskTypes[name] = metricTime

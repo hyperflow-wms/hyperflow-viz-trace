@@ -28,7 +28,8 @@ def buildJobMap(jobDescriptions):
     for row in jobDescriptions:
         jobId = row['jobId']
         if jobId in jobMap:
-            raise Exception('Duplicated description for job {}'.format(jobId))
+            print("WARNING: duplicated job description for", jobId)
+            #raise Exception('Duplicated description for job {}'.format(jobId))
         jobMap[jobId] = row
     return jobMap
 

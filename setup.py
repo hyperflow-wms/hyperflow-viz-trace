@@ -2,7 +2,7 @@ import setuptools
 
 setuptools.setup(
     name="hyperflow-viz-trace",
-    version="1.3.0",
+    version="1.3.1",
     description="Tool for visualization of HyperFlow execution traces",
     url="https://github.com/hyperflow-wms/hyperflow-viz-trace",
     packages=setuptools.find_packages(),

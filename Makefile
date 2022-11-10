@@ -14,4 +14,7 @@ push: image
 	docker push $(PREFIX)/$(REPO_NAME) # Push image tagged as latest to repository
 	docker push $(PREFIX)/$(REPO_NAME):$(TAG) # Push version tagged image to repository (since this image is already pushed it will simply create or update version tag)
 
+test: image
+	docker run --rm --entrypoint "/bin/sh" -v $(PWD)/test-data/montage2_d3.0_logs:/test-data hyperflowwms/viz-trace -c "cd /test-data && hflow-viz-trace -s /test-data"
+
 clean:

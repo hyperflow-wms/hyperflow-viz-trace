@@ -271,27 +271,14 @@ def extractStages(metricList, event_start='jobStart', event_end='jobEnd'):
     return stages
 
 def broken_barh_without_scaling(axis, xranges, yrange, **kwargs):
-
-    # process the unit information
-    if len(xranges):
-        xdata = cbook.safe_first_element(xranges) # ENTERED
-    else:
-        xdata = None
-    if len(yrange):
-        ydata = cbook.safe_first_element(yrange) # ENTERED
-    else:
-        ydata = None
-    axis._process_unit_info(xdata=xdata,
-                            ydata=ydata,
-                            kwargs=kwargs)
     xranges_conv = []
     for xr in xranges:
         if len(xr) != 2:
             raise ValueError('each range in xrange must be a sequence '
-                                'with two elements (i.e. an Nx2 array)')
+                             'with two elements (i.e. an Nx2 array)')
         # convert the absolute values, not the x and dx...
         x_conv = np.asarray(axis.convert_xunits(xr[0]))
-        x1 = axis._convert_dx(xr[1], xr[0], x_conv, axis.convert_xunits)
+        x1 = axis.convert_xunits(xr[0] + xr[1]) - x_conv
         xranges_conv.append((x_conv, x1))
 
     yrange_conv = axis.convert_yunits(yrange)
@@ -301,6 +288,7 @@ def broken_barh_without_scaling(axis, xranges, yrange, **kwargs):
 
     return col
 
+
 def lightenColor(color, amount=0.5):
     try:
         c = mc.cnames[color]
@@ -308,7 +296,6 @@ def lightenColor(color, amount=0.5):
         c = color
     c = colorsys.rgb_to_hls(*mc.to_rgb(c))
     return colorsys.hls_to_rgb(c[0], 1 - amount * (1 - c[1]), c[2])
-
 
 def visualizeDir(sourceDir, displayOnly, showActiveJobs, plotFullNodesNames):
     metricsPath = os.path.join(sourceDir, 'metrics.jsonl')
@@ -327,10 +314,11 @@ def visualizeDir(sourceDir, displayOnly, showActiveJobs, plotFullNodesNames):
     # Prepare axis data
     rowHalfHeight = 15
     rowFullHeight = rowHalfHeight * 2
-    y_ticks = range(rowHalfHeight, (len(nodesJobsNO)+1)*rowFullHeight, rowFullHeight)
-    y_labels = [(key) for key in natsorted(nodesJobsNO.keys())]
+    y_ticks = list(range(rowHalfHeight, (len(nodesJobsNO))*rowFullHeight, rowFullHeight))
+    y_labels = [key for key in natsorted(nodesJobsNO.keys())]
     if plotFullNodesNames is False:
-        y_labels = map(lambda label: label.rsplit('-', 1)[-1], y_labels)
+        y_labels = [label.rsplit('-', 1)[-1] for label in y_labels]
+
     max_time = 0.0
     for _, jobGroup in nodesJobsNO.items():
         for jobID in jobGroup:
@@ -342,10 +330,9 @@ def visualizeDir(sourceDir, displayOnly, showActiveJobs, plotFullNodesNames):
     max_time = math.ceil(max_time)
 
     # Prepare color scheme
-    colors = plt.cm.get_cmap("gist_rainbow", len(taskTypes))
-    colorsForTaskTypes = {}
-    for i, taskType in enumerate(taskTypes):
-        colorsForTaskTypes[taskType] = colors(i)
+    cmap = plt.cm.get_cmap("gist_rainbow")
+    colors = cmap(np.linspace(0, 1, len(taskTypes)))
+    colorsForTaskTypes = {taskType: colors[i] for i, taskType in enumerate(taskTypes)}
 
     # Preparing chart background
     plt.rc('figure', figsize=(25,15))
@@ -445,7 +432,6 @@ def visualizeDir(sourceDir, displayOnly, showActiveJobs, plotFullNodesNames):
         print('Chart saved to {}'.format(filename))
     return
 
-
 def main():
     parser = argparse.ArgumentParser(description='HyperFlow execution visualizer')
     parser.add_argument('-s', '--source', type=str, required=True, help='Directory with parsed logs')
@@ -458,3 +444,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+

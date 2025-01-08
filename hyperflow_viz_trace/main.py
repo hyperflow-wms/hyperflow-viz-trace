@@ -336,6 +336,7 @@ def visualizeDir(sourceDir, displayOnly, showActiveJobs, plotFullNodesNames):
         for jobID in jobGroup:
             fullNodeName = jobMap[jobID]['nodeName']
             jobDetails = nodesJobs[fullNodeName][jobID]
+            print("jobID={} jobDetails={}", jobID, jobDetails)
             for typex in ['handlerStart', 'jobStart', 'jobEnd', 'handlerEnd']:
                 if jobDetails[typex] > max_time:
                     max_time = jobDetails[typex]

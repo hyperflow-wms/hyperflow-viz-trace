@@ -1,459 +1,289 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
-from collections import defaultdict
-from natsort import natsorted, ns
-from scipy import interpolate
 import os
 import argparse
-import jsonlines
-import pandas as pd
-import datetime
-import matplotlib.cbook as cbook
-import matplotlib.colors as mc
-import matplotlib.collections as mcoll
-import colorsys
 import math
+from collections import defaultdict
+
+import pandas as pd
 import matplotlib.pyplot as plt
-import numpy as np
-import sys
+from matplotlib.colors import to_rgb
+import matplotlib.patches as mpatches
+from matplotlib.collections import PatchCollection
+import colorsys
+from natsort import natsorted
+import mplcursors
 
 
-def strToDatetime(dateTimeString):
-    pattern = '%Y-%m-%dT%H:%M:%S.%f'
-    dateTime = datetime.datetime.strptime(dateTimeString, pattern)
-    return dateTime
+def load_jsonl(path):
+    df = pd.read_json(path, lines=True)
+    if 'time' in df.columns:
+        df['time'] = pd.to_datetime(df['time'], errors='coerce')
+    return df
 
-def buildJobMap(jobDescriptions):
-    jobMap = {}
-    for row in jobDescriptions:
-        jobId = row['jobId']
-        if jobId in jobMap:
-            print("WARNING: duplicated job description for", jobId)
-            #raise Exception('Duplicated description for job {}'.format(jobId))
-        jobMap[jobId] = row
-    return jobMap
 
-def buildMetricList(metrics):
-    metricList = []
-    for metric in metrics:
-        newMetric = metric.copy()
-        newMetric['time'] = strToDatetime(newMetric['time'])
-        metricList.append(newMetric)
-    return metricList
+def build_job_map(job_descriptions):
+    return {job['jobId']: job for job in job_descriptions.to_dict('records')}
 
-def getLastEventDatetime(metricList):
-    maxTime = None
-    for metric in metricList:
-        if metric['parameter'] != 'event':
+
+def assert_single_value(items, key):
+    values = set(item[key] for item in items)
+    if len(values) != 1:
+        raise ValueError(f"Inconsistent values for '{key}': {values}")
+    return values.pop()
+
+
+def extract_event_metrics(metrics_df):
+    return metrics_df[metrics_df['parameter'] == 'event'].copy()
+
+
+
+def extract_nodes_jobs(event_metrics, job_map):
+    first_event_time = event_metrics['time'].min()
+    nodes_jobs = defaultdict(lambda: defaultdict(dict))
+
+    for _, row in event_metrics.iterrows():
+        job_id = row['jobId']
+        node = job_map[job_id]['nodeName']
+        event = row['value']
+        timestamp = (row['time'] - first_event_time).total_seconds()
+
+        job_events = nodes_jobs[node][job_id]
+
+        if event in job_events:
+            if event == 'handlerStart' and timestamp > job_events[event]:
+                print(f'WARNING: inconsistent logs - second handlerStart for job {job_id}, keeping earlier')
+                continue
+            else:
+                print(f'WARNING: duplicate event "{event}" for job {job_id}, ignoring second occurrence')
+                continue
+
+        job_events[event] = timestamp
+
+    return nodes_jobs
+
+
+def split_disjoint_groups(jobs):
+    intervals = []
+    for job_id, details in jobs.items():
+        start = details.get('handlerStart')
+        end = details.get('handlerEnd') or details.get('jobEnd')
+        if start is None or end is None:
+            print(f"WARNING: Skipping job {job_id} — missing handlerStart or end time")
             continue
-        time = metric['time']
-        if maxTime is None or time > maxTime:
-            maxTime = time
-    return maxTime
-
-def splitJobsIntoDisjointGroups(jobs):
-
-    # firstly we prepare ordered map of jobs (order by start time)
-    jobsByStartTime = {}
-    for jobId, jobDetails in jobs.items():
-        timeStart = jobDetails['handlerStart']
-        if ('handlerEnd' not in jobDetails): # dirty fix if for some reason 'handlerEnd' is missing
-            print("WARNING: missing handlerEnd event in job", jobId)
-            jobDetails['handlerEnd'] = jobDetails['jobEnd']
-        if timeStart not in jobsByStartTime:
-            jobsByStartTime[timeStart] = []
-        details = jobDetails.copy()
-        details['jobId'] = jobId
-        jobsByStartTime[timeStart].append(details)
-
-    unplacedJobsSorted = sorted(jobsByStartTime.items())
+        intervals.append((start, end, job_id))
+    intervals.sort()
 
     groups = []
+    group_end_times = []
 
-    jobs.copy()
-    currentEnd = None
-    currentGroup = []
-    while len(unplacedJobsSorted) != 0:
-
-        # loop for finding job with smallest handlerStart,
-        # but greater that last handlerEnd in group
-        best_job = None
-        i = 0
-        while i < len(unplacedJobsSorted):
-            unplacedJobsKV = unplacedJobsSorted[i]
-            timeStart = unplacedJobsKV[0]
-            jobsAtTime = unplacedJobsKV[1]
-            j = 0
-            while j < len(jobsAtTime):
-                unplacedJob = jobsAtTime[j]
-                if (currentEnd is None) or (timeStart > currentEnd):
-                    # print(unplacedJob['handlerStart'], unplacedJob['handlerEnd'])
-                    currentGroup.append(unplacedJob['jobId'])
-                    currentEnd = unplacedJob['handlerEnd']
-                    del jobsAtTime[j]
-                    continue
-                j += 1
-
-            if len(jobsAtTime) == 0:
-                del unplacedJobsSorted[i]
-                continue
-            i += 1
-
-        # print('---')
-        if best_job is None:
-            groups.append(currentGroup)
-            currentGroup = []
-            currentEnd = None
-
-    if currentGroup != []:
-        groups.append(currentGroup)
+    for start, end, job_id in intervals:
+        placed = False
+        for i, group_end in enumerate(group_end_times):
+            if start > group_end:
+                groups[i].append(job_id)
+                group_end_times[i] = end
+                placed = True
+                break
+        if not placed:
+            groups.append([job_id])
+            group_end_times.append(end)
 
     return groups
 
 
-def findLatestDir(sourceDir):
-
-    def match(filename):
-        if os.path.isdir(os.path.join(sourceDir, filename)) is False:
-            return False
-        if '__' not in os.path.basename(filename):
-            return False
-        return True
-
-    matchedDirs = [d for d in os.listdir(sourceDir) if match(d)]
-    newestDir = max((os.path.getmtime(os.path.join(sourceDir, f)),f) for f in matchedDirs)[1]
-
-    fullPath = os.path.join(sourceDir, newestDir)
-    return fullPath
+def extract_nodes_jobs_nonoverlap(nodes_jobs):
+    output = {}
+    for node, jobs in nodes_jobs.items():
+        disjoint = split_disjoint_groups(jobs)
+        for i, group in enumerate(disjoint):
+            key = f"{node}_{i}"
+            output[key] = group
+    return output
 
 
-def loadJsonlFile(path):
-    rows = []
-    with jsonlines.open(path) as reader:
-        for row in reader:
-            rows.append(row)
-    return rows
+def extract_ordered_task_types(event_metrics):
+    latest_by_name = event_metrics.groupby('name')['time'].max()
+    return list(latest_by_name.sort_values().index)
 
 
-def getWorkflowName(jobDescriptions):
-    name = jobDescriptions[0]['workflowName']
-    # additional checks
-    for row in jobDescriptions:
-        if row['workflowName'] != name:
-            raise Exception("Inconsistent jobDescriptions. New workflow name '{}'".format(row['workflowName'])
-                + "; last known '{}'.".format(name))
-    return name
+def extract_stages(event_metrics, event_start='jobStart', event_end='jobEnd'):
+    first_event_time = event_metrics['time'].min()
+    stage_events = defaultdict(list)
 
-def getWorkflowSize(jobDescriptions):
-    size = jobDescriptions[0]['size']
-    # additional checks
-    for row in jobDescriptions:
-        if row['size'] != size:
-            raise Exception("Inconsistent jobDescriptions. New size '{}'".format(row['size'])
-                + "; last known '{}'.".format(size))
-    return size
-
-def getWorkflowVersion(jobDescriptions):
-    version = jobDescriptions[0]['version']
-    # additional checks
-    for row in jobDescriptions:
-        if row['version'] != version:
-            raise Exception("Inconsistent jobDescriptions. New version '{}'".format(row['version'])
-                + "; last known '{}'.".format(version))
-    return version
-
-def getNodeNameForJob(jobId, jobDescriptionsDf):
-    name = jobDescriptionsDf.loc[jobDescriptionsDf.jobId==jobId].nodeName.iloc[0]
-    return name
-
-def getFirstEventDatetime(metricList):
-    minTime = None
-    for metric in metricList:
-        if metric['parameter'] != 'event':
-            continue
-        time = metric['time']
-        if minTime is None or time < minTime:
-            minTime = time
-    return minTime
-
-def extractNodesJobs(metricList, jobMap):
-
-    nodesJobsMap = {}
-    firstEventTime = getFirstEventDatetime(metricList)
-
-    for metric in metricList:
-
-        if metric['parameter'] != 'event':
+    for _, row in event_metrics.iterrows():
+        event = row['value']
+        if event not in (event_start, event_end):
             continue
 
-        jobId = metric['jobId']
-        nodeName = jobMap[jobId]['nodeName']
-
-        if nodeName not in nodesJobsMap:
-            nodesJobsMap[nodeName] = {}
-
-        if jobId not in nodesJobsMap[nodeName]:
-            nodesJobsMap[nodeName][jobId] = {}
-
-        eventType = metric['value']
-        eventTime = metric['time']
-        eventTimeDiff = (eventTime - firstEventTime).total_seconds()
-
-        if eventType in nodesJobsMap[nodeName][jobId]:
-
-            # temproarily just ignore newer handlerStarts
-            if (eventType == 'handlerStart') and (eventTimeDiff > nodesJobsMap[nodeName][jobId][eventType]):
-                print('WARNING: inconsistent logs - too many handlerStart occurences.')
-                continue
-
-            raise Exception('There was already "{}" event for job "{}"'.format(eventType, jobId))
-
-        nodesJobsMap[nodeName][jobId][eventType] = eventTimeDiff
-
-    return nodesJobsMap
-
-
-def extractNodesJobsNonoverlap(nodesJobs):
-    nodesJobsNonoverlap = {}
-    for nodeName, jobs in nodesJobs.items():
-        # fix sorting for first node name
-        if any(char.isdigit() for char in nodeName) is False:
-            nodeName += "1"
-
-        jobGroups = splitJobsIntoDisjointGroups(jobs)
-        for i, jobGroup in enumerate(jobGroups):
-            nodesJobsNonoverlap[nodeName + '_' + str(i)] = jobGroup
-    return nodesJobsNonoverlap
-
-
-def extractOrderedTaskTypes(metricList):
-    taskTypes = {}
-    for metric in metricList:
-        if metric['parameter'] != 'event':
-            continue
-        try:
-            name = metric['name']
-        except:
-            continue; # ignoring metric with no job name - probably evicted pod 
-            #raise KeyError('metric[name]', metric);
-        metricTime = metric['time']
-        if name not in taskTypes:
-            taskTypes[name] = metricTime
-        elif taskTypes[name] < metricTime:
-            taskTypes[name] = metricTime
-
-    orderedTaskTypes = sorted(taskTypes, key=taskTypes.get)
-    return orderedTaskTypes
-
-def extractStages(metricList, event_start='jobStart', event_end='jobEnd'):
-
-    firstEventTime = getFirstEventDatetime(metricList)
-    stageEvents = defaultdict(list)
-    for metric in metricList:
-
-        if metric['parameter'] != 'event':
-            continue
-
-        metricTimeOffset = (metric['time'] - firstEventTime).total_seconds()
-        eventType = metric['value']
-        if eventType == event_start:
-            stageEvents[metricTimeOffset].append(1)
-        elif eventType == event_end:
-            stageEvents[metricTimeOffset].append(-1)
+        offset = (row['time'] - first_event_time).total_seconds()
+        stage_events[offset].append(1 if event == event_start else -1)
 
     stages = [{'timeOffset': 0.0, 'activeItems': 0}]
-    numActiveItems = 0
+    active = 0
 
-    for timeOffset, changes in sorted(stageEvents.items()):
+    for time, changes in sorted(stage_events.items()):
         for change in changes:
-            numActiveItems += change
-        stages.append({'timeOffset': timeOffset, 'activeItems': numActiveItems})
+            active += change
+        stages.append({'timeOffset': time, 'activeItems': active})
+
     return stages
 
-def broken_barh_without_scaling(axis, xranges, yrange, **kwargs):
 
-    # process the unit information
-    if len(xranges):
-        xdata = cbook.safe_first_element(xranges) # ENTERED
-    else:
-        xdata = None
-    if len(yrange):
-        ydata = cbook.safe_first_element(yrange) # ENTERED
-    else:
-        ydata = None
-    axis._process_unit_info(xdata=xdata,
-                            ydata=ydata,
-                            kwargs=kwargs)
-    xranges_conv = []
-    for xr in xranges:
-        if len(xr) != 2:
-            raise ValueError('each range in xrange must be a sequence '
-                                'with two elements (i.e. an Nx2 array)')
-        # convert the absolute values, not the x and dx...
-        x_conv = np.asarray(axis.convert_xunits(xr[0]))
-        x1 = axis._convert_dx(xr[1], xr[0], x_conv, axis.convert_xunits)
-        xranges_conv.append((x_conv, x1))
-
-    yrange_conv = axis.convert_yunits(yrange)
-
-    col = mcoll.BrokenBarHCollection(xranges_conv, yrange_conv, **kwargs)
-    axis.add_collection(col, autolim=False)
-
-    return col
-
-def lightenColor(color, amount=0.5):
-    try:
-        c = mc.cnames[color]
-    except:
-        c = color
-    c = colorsys.rgb_to_hls(*mc.to_rgb(c))
-    return colorsys.hls_to_rgb(c[0], 1 - amount * (1 - c[1]), c[2])
+def lighten_color(color, amount=0.5):
+    r, g, b = to_rgb(color)
+    h, l, s = colorsys.rgb_to_hls(r, g, b)
+    return colorsys.hls_to_rgb(h, 1 - amount * (1 - l), s)
 
 
-def visualizeDir(sourceDir, displayOnly, showActiveJobs, plotFullNodesNames):
-    metricsPath = os.path.join(sourceDir, 'metrics.jsonl')
-    metrics = loadJsonlFile(metricsPath)
+def visualize_dir(source_dir, display_only, show_active_jobs, plot_full_names, interactive):
+    metrics_path = os.path.join(source_dir, 'metrics.jsonl')
+    job_desc_path = os.path.join(source_dir, 'job_descriptions.jsonl')
 
-    jobDescriptionsPath = os.path.join(sourceDir, 'job_descriptions.jsonl')
-    jobDescriptions = loadJsonlFile(jobDescriptionsPath)
+    metrics_df = load_jsonl(metrics_path)
+    job_descriptions = load_jsonl(job_desc_path)
+    job_map = build_job_map(job_descriptions)
 
-    jobMap = buildJobMap(jobDescriptions)
-    metricList = buildMetricList(metrics)
-    workflowName = getWorkflowName(jobDescriptions)
-    nodesJobs = extractNodesJobs(metricList, jobMap)
-    nodesJobsNO = extractNodesJobsNonoverlap(nodesJobs)
-    taskTypes = extractOrderedTaskTypes(metricList)
+    workflow_name = assert_single_value(job_descriptions.to_dict('records'), 'workflowName')
+    workflow_size = assert_single_value(job_descriptions.to_dict('records'), 'size')
+    workflow_version = assert_single_value(job_descriptions.to_dict('records'), 'version')
 
-    # Prepare axis data
-    rowHalfHeight = 15
-    rowFullHeight = rowHalfHeight * 2
-    y_ticks = range(rowHalfHeight, (len(nodesJobsNO)+1)*rowFullHeight, rowFullHeight)
-    y_labels = [(key) for key in natsorted(nodesJobsNO.keys())]
-    if plotFullNodesNames is False:
-        y_labels = map(lambda label: label.rsplit('-', 1)[-1], y_labels)
+    event_metrics = extract_event_metrics(metrics_df)
+    nodes_jobs = extract_nodes_jobs(event_metrics, job_map)
+    nodes_jobs_no = extract_nodes_jobs_nonoverlap(nodes_jobs)
+    task_types = extract_ordered_task_types(event_metrics)
+
+    row_half = 15
+    row_full = row_half * 2
+    sorted_nodes = natsorted(nodes_jobs_no.keys())
+    y_labels = sorted_nodes if plot_full_names else [k.rsplit('-', 1)[-1] for k in sorted_nodes]
+    y_ticks = [row_half + i * row_full for i in range(len(sorted_nodes))]
+
     max_time = 0.0
-    for _, jobGroup in nodesJobsNO.items():
-        for jobID in jobGroup:
-            fullNodeName = jobMap[jobID]['nodeName']
-            jobDetails = nodesJobs[fullNodeName][jobID]
-            for typex in ['handlerStart', 'jobStart', 'jobEnd', 'handlerEnd']:
-                if jobDetails[typex] > max_time:
-                    max_time = jobDetails[typex]
+    for node_key in sorted_nodes:
+        for job_id in nodes_jobs_no[node_key]:
+            full_node = job_map[job_id]['nodeName']
+            details = nodes_jobs[full_node][job_id]
+            for evt in ['handlerStart', 'jobStart', 'jobEnd', 'handlerEnd']:
+                if evt in details:
+                    max_time = max(max_time, details[evt])
     max_time = math.ceil(max_time)
 
-    # Prepare color scheme
-    colors = plt.cm.get_cmap("gist_rainbow", len(taskTypes))
-    colorsForTaskTypes = {}
-    for i, taskType in enumerate(taskTypes):
-        colorsForTaskTypes[taskType] = colors(i)
-
-    # Preparing chart background
-    plt.rc('figure', figsize=(25,15))
-    if showActiveJobs:
-        fig, (gnt, gnt2) = plt.subplots(2, 1, gridspec_kw={'height_ratios': [3, 1]})
-        plt.suptitle(workflowName)
+    if show_active_jobs:
+        fig, (ax, ax2) = plt.subplots(2, 1, figsize=(25, 15), gridspec_kw={'height_ratios': [3, 1]})
+        ax.set_title(f'Workflow: {workflow_name}')
     else:
-        fig, gnt = plt.subplots()
-        plt.suptitle(workflowName)
+        fig, ax = plt.subplots(figsize=(25, 15))
+        ax.set_title(f'Workflow: {workflow_name}')
 
-    # Plot background color for even lanes
-    lastKnownNode = None
-    secondColorEnabled = False
-    for i, nodeKey in enumerate(natsorted(nodesJobsNO)): # same order as in plot
-        jobGroup = nodesJobsNO[nodeKey]
-        firstJobID = jobGroup[0]
-        fullNodeName = jobMap[firstJobID]['nodeName']
-        if fullNodeName != lastKnownNode:
-            lastKnownNode = fullNodeName
-            secondColorEnabled = not secondColorEnabled
-        if secondColorEnabled:
-            gnt.axhspan(rowFullHeight*i, rowFullHeight*(i+1), facecolor='grey', alpha=0.2)
+    cmap = plt.get_cmap("gist_rainbow", len(task_types))
+    colors_for_types = dict(zip(task_types, [cmap(i) for i in range(len(task_types))]))
 
-    ### SUBPLOT 1
+    ax.set_xlim(0, max_time)
+    ax.set_xlabel('Time [s]')
+    ax.set_ylabel('Node offset')
+    ax.set_yticks(y_ticks)
+    ax.set_yticklabels(y_labels)
+    ax.grid(True)
 
-    gnt.title.set_text('Execution process')
-    gnt.set_xlim(0, max_time)
-    gnt.set_xlabel('Time [s]')
-    gnt.set_ylabel('Node_offset')
-    gnt.grid(True)
-    gnt.set_yticks(y_ticks)
-    gnt.set_yticklabels(y_labels)
+    # 🔁 Alternating background shading by physical node
+    last_node = None
+    shade = False
+    for i, node_key in enumerate(sorted_nodes):
+        job_id = nodes_jobs_no[node_key][0]
+        full_node = job_map[job_id]['nodeName']
+        if full_node != last_node:
+            shade = not shade
+            last_node = full_node
+        if shade:
+            y_start = row_full * i
+            ax.axhspan(y_start, y_start + row_full, color='gray', alpha=0.2, zorder=0)
 
-    # Plotting chart data
-    usedLabels = set()
-    for i, nodeKey in enumerate(natsorted(nodesJobsNO)):
-        jobGroup = nodesJobsNO[nodeKey]
-        for jobID in jobGroup:
-            job = jobMap[jobID]
-            fullNodeName =  job['nodeName']
-            jobDetails = nodesJobs[fullNodeName][jobID]
-            cColor = colorsForTaskTypes[job['name']]
-            cLabel = job['name']
-            # prevent duplicated tasks at legend
-            if cLabel in usedLabels:
-                cLabel = ""
-            else:
-                usedLabels.add(job['name'])
+    patches_by_task = defaultdict(list)
+    legend_labels = {}
 
-            broken_barh_without_scaling(gnt, [(jobDetails['jobStart'], jobDetails['jobEnd']-jobDetails['jobStart'])], ((rowHalfHeight+rowFullHeight*i)-8, 16), color=cColor, label=cLabel)
-            broken_barh_without_scaling(gnt, [(jobDetails['handlerStart'], jobDetails['handlerEnd']-jobDetails['handlerStart'])], ((rowHalfHeight+rowFullHeight*i)-2, 4), color=lightenColor(cColor,1.3))
+    for i, node in enumerate(sorted_nodes):
+        jobs = nodes_jobs_no[node]
+        bar_y = row_half + row_full * i
+        for job_id in jobs:
+            job = job_map[job_id]
+            node_name = job['nodeName']
+            job_details = nodes_jobs[node_name][job_id]
 
-    # Draw legend
-    handles, labels = gnt.get_legend_handles_labels()
-    lOrders = []
-    for taskType in taskTypes:
-        order = labels.index(taskType)
-        lOrders.append(order)
-    gnt.legend([handles[idx] for idx in lOrders],[labels[idx] for idx in lOrders], loc='upper center', bbox_to_anchor=(0.5, 1.05),
-          ncol=3, fancybox=True, shadow=True)
+            # Skip jobs missing jobStart or jobEnd
+            if 'jobStart' not in job_details or 'jobEnd' not in job_details:
+                print(f"WARNING: Skipping job {job_id} — missing jobStart or jobEnd")
+                continue
 
-    ### SUBPLOT 2
+            task = job['name']
+            color = colors_for_types[task]
 
-    if showActiveJobs:
-        gnt2.title.set_text('Active jobs')
-        gnt2.set_xlim(0, max_time)
-        gnt2.set_xlabel('Time [s]')
-        gnt2.set_ylabel('Number of jobs')
-        gnt2.grid(True)
+            x = job_details['jobStart']
+            width = job_details['jobEnd'] - job_details['jobStart']
+            rect = mpatches.Rectangle((x, bar_y - 8), width, 16)
+            patches_by_task[task].append((rect, job_id, x, x + width))
 
-        stages = extractStages(metricList)
-        stages_x = []
-        stages_y = []
-        for stage in stages:
-            stages_x.append(stage['timeOffset'])
-            stages_y.append(stage['activeItems'])
-        plt.step(stages_x, stages_y, label='exact value')
+            if task not in legend_labels:
+                legend_labels[task] = color
 
-        #DEG = 10
+    for task, rect_data in patches_by_task.items():
+        rects = [r[0] for r in rect_data]
+        pc = PatchCollection(rects, facecolor=colors_for_types[task], label=task)
+        ax.add_collection(pc)
 
-        #f = np.poly1d(np.polyfit(np.array(stages_x), np.array(stages_y), DEG))
-        #xnew = np.linspace(0, max_time, len(stages)*100)
-        #ynew = f(xnew)
-        #plt.plot(xnew, ynew, label='approximation ({}-degree)'.format(DEG), ls='--', color='red')
+        if interactive:
+            cursor = mplcursors.cursor(pc, hover=True)
 
-        gnt2.legend(loc="best")
+            @cursor.connect("add")
+            def on_add(sel, task=task, data=rect_data):
+                idx = sel.index
+                rect_info = data[idx[0] if isinstance(idx, tuple) else idx]
+                job_id = rect_info[1]
+                start = rect_info[2]
+                end = rect_info[3]
+                job = job_map[job_id]
+                sel.annotation.set_text(
+                    f"{job['name']}\nJob ID: {job_id}\nStart: {start:.2f}s\nEnd: {end:.2f}s"
+                )
 
-    ### COMMON
+    ax.legend(
+        [mpatches.Patch(color=legend_labels[task], label=task) for task in legend_labels],
+        list(legend_labels.keys()),
+        loc='upper center', bbox_to_anchor=(0.5, 1.05), ncol=3, fancybox=True, shadow=True
+    )
 
-    if displayOnly is True:
+    if show_active_jobs:
+        ax2.set_xlim(0, max_time)
+        ax2.set_xlabel('Time [s]')
+        ax2.set_ylabel('Active jobs')
+        ax2.grid(True)
+
+        stages = extract_stages(event_metrics)
+        stage_x = [s['timeOffset'] for s in stages]
+        stage_y = [s['activeItems'] for s in stages]
+
+        ax2.step(stage_x, stage_y, where='post', label='Active jobs')
+        ax2.legend(loc='best')
+
+    filename = f'{workflow_name}-{workflow_size}-{workflow_version}.png'
+
+    if display_only:
         plt.show()
     else:
-        wfSize = getWorkflowSize(jobDescriptions)
-        wfVersion = getWorkflowVersion(jobDescriptions)
-        filename = '{}-{}-{}.png'.format(workflowName, wfSize, wfVersion)
         plt.savefig(filename)
-        print('Chart saved to {}'.format(filename))
-    return
+        print(f"Chart saved to {filename}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description='HyperFlow execution visualizer')
+    parser = argparse.ArgumentParser(description='HyperFlow execution visualizer with tooltips and lane shading')
     parser.add_argument('-s', '--source', type=str, required=True, help='Directory with parsed logs')
     parser.add_argument('-d', '--show', action='store_true', default=False, help='Display plot instead of saving to file')
     parser.add_argument('-a', '--show-active-jobs', action='store_true', default=False, help='Display the number of active jobs subplot')
     parser.add_argument('-f', '--full-nodes-names', action='store_true', default=False, help='Display full nodes\' names')
+    parser.add_argument('-i', '--interactive', action='store_true', default=False, help='Enable interactive hover tooltips')
     args = parser.parse_args()
-    visualizeDir(args.source, args.show, args.show_active_jobs, args.full_nodes_names)
+
+    visualize_dir(args.source, args.show, args.show_active_jobs, args.full_nodes_names, args.interactive)
 
 
 if __name__ == '__main__':
